@@ -66,12 +66,34 @@
 - **Selective Recomputation**: 只重计算显存大、重算快的 op（如 Attention），不重算显存小、重算慢的 op。
 - 📖 [Selective Recomputation](papers/Selective%20Recomputation%20SP.pdf)
 
-### FP8 / FP4 低精度训练
-- **FP8 E4M3/E5M2**: E4M3 精度高（Fprop），E5M2 动态范围大（Dgrad/Wgrad）。DeepSeek-V3 首次验证超大规模 FP8 训练的可行性。
-- **细粒度量化**: 不是 per-tensor，而是 1×128（激活）或 128×128（权重）分组缩放 → 减少 outlier 的量化误差。
-- **FP4 QAT (V4)**: 训练时 FP32 master → 量化到 FP4 → 反量化到 FP8 → GEMM（STE 回传）。
-- **累加精度**: H800 FP8 GEMM 只保留 14 位累加精度 → 每 128 个元素提升到 CUDA Core FP32 累加。
-- 📖 [FP8 Formats](papers/FP8%20Formats.pdf) · [DeepSeek-V3 FP8](papers-zh/DeepSeek-V3.md#33-fp8-训练)
+### 混合精度训练 (Mixed Precision Training) — [📝 专题笔记](topics/mixed-precision-training.md) · [🔬 DeepSeek-V3 FP8 详解](notes/mixed-precision-training/deepseek-v3-fp8-training.md) · [🔬 DeepSeek-V4 FP8/FP4 详解](notes/mixed-precision-training/deepseek-v4-mixed-precision.md)
+
+> 系统性地整理：浮点格式 → BF16/FP8/FP4 训练方案 → 精度敏感算子 → 论文分析大纲。
+
+#### 浮点数格式速查
+- **FP32 (1-8-23)**: 训练权威副本（master weight），范围 ±3.4×10³⁸，精度 ~7 位十进制有效数字。
+- **FP16 (1-5-10)**: 范围仅 ±65504，需要 Loss Scaling 防止梯度 underflow。机器精度 \(2^{-10} \approx 9.77\times 10^{-4}\)。
+- **BF16 (1-8-7)**: 指数与 FP32 相同（8 位）→ 动态范围等同 FP32 → **不需要 Loss Scaling**。当前大模型训练主流。
+- **FP8 E4M3 (1-4-3)**: 精度优先（3 位尾数），范围 ±448 → 用于前向传播（激活值分布稳定）。
+- **FP8 E5M2 (1-5-2)**: 范围优先（5 位指数）→ 用于反向传播（梯度动态范围大）。
+- **FP4 E2M1 (1-2-1)**: 仅 16 个可表示值 → QAT 模拟训练（FP32 master → FP4 quant → FP8 dequant → GEMM）。
+- 📖 [格式对比详表](topics/mixed-precision-training.md#11-浮点数表示格式-floating-point-formats)
+
+#### 混合精度训练方案对比
+| 方案 | 精度敏感 op | 需要 Loss Scaling | 细粒度量化 | 代表模型 |
+|------|------------|------------------|-----------|---------|
+| FP16 + AMP | 保持 FP32 | ✅ 必须 | ❌ | BERT, GPT-2 |
+| BF16 | 保持 FP32/BF16 | ❌ 不需要 | ❌ | LLaMA, V3/V4 |
+| FP8 (V3) | 保持 BF16/FP32 | ❌ (tile scaling 替代) | ✅ 1×128 / 128×128 | DeepSeek-V3 |
+| FP4 QAT (V4) | 保持 BF16/FP32 | ❌ (QAT 内置) | ✅ per-group | DeepSeek-V4 |
+
+#### 核心经验知识
+- **精度敏感算子**: Embedding > Softmax > Norm > Loss ≈ Optimizer Step >> GEMM ≈ RoPE。非线性和统计量操作保持高精度，线性操作（GEMM）可用低精度。
+- **细粒度量化**: Per-tensor 量化中 outlier 主导 scale factor → 大部分值精度被浪费。Per-tile（1×128 或 128×128）独立缩放 → 精度大幅提升。
+- **提升累加精度**: H800 FP8 Tensor Core 仅 14 位累加精度 → 每 128 个元素做一次 FP32 partial sum 提升。
+- **BF16 vs FP16 选择**: A100+ 硬件上无脑选 BF16 — 动态范围远大于精度优势。
+- 📖 [精度敏感算子详细列表](topics/mixed-precision-training.md#15-精度敏感算子-precision-sensitive-operations)
+- 📖 [FP8 Formats](papers/FP8%20Formats.pdf) · [DeepSeek-V3 FP8](papers-zh/DeepSeek-V3.md#33-fp8-训练) · [V4 FP8/FP4](notes/mixed-precision-training/deepseek-v4-mixed-precision.md) · [V4 FP4 QAT](papers-zh/DeepSeek-V4-technical-report.zh.md)
 
 ### CPU/NVMe Offload
 - **ZeRO-Infinity**: 将优化器状态、梯度、参数 offload 到 CPU DRAM 甚至 NVMe SSD。
@@ -237,10 +259,14 @@ Aux Loss 的梯度与 LM loss 竞争 → 多目标优化的 trade-off → α 难
 📖 [DeepSeek-V3 2.1.2](papers-zh/DeepSeek-V3.md#212-带无辅助损失负载均衡的-deepseekmoe)
 
 ### Q7: FP8 训练为什么能成功？有哪些关键技巧？
-(1) 细粒度量化（1×128 tile-level 而非 per-tensor）；(2) 提高累加精度（CUDA Core FP32 累加）；(3) 关键 op 保留高精度（Embedding/Attention/Norm）；(4) 缩放在线计算（不存历史 max）。
-📖 [DeepSeek-V3 3.3](papers-zh/DeepSeek-V3.md#33-fp8-训练)
+(1) 细粒度量化（1×128 tile-level 而非 per-tensor）；(2) 提高累加精度（CUDA Core FP32 累加，每 128 元素提升一次）；(3) 关键 op 保留高精度（Embedding/Attention/Norm/Gate/Loss）；(4) 缩放在线计算（不存历史 max）。
+📖 [DeepSeek-V3 FP8 详解](notes/mixed-precision-training/deepseek-v3-fp8-training.md) · [DeepSeek-V3 3.3](papers-zh/DeepSeek-V3.md#33-fp8-训练) · [混合精度训练专题](topics/mixed-precision-training.md)
 
-### Q8: EP 通信为什么批大小敏感？
+### Q8: BF16 和 FP16 应该选哪个？为什么大模型都在用 BF16？
+BF16 动态范围 = FP32（8 位指数相同）→ 不需要 loss scaling → 训练更稳定，零心智负担。FP16 精度虽高（10 位 vs 7 位尾数），但动态范围小（最大 65504）→ 必须精细调整 loss scale → 大模型训练中得不偿失。A100+ 硬件上无脑选 BF16。
+📖 [混合精度训练 FAQ](topics/mixed-precision-training.md#q1-bf16-和-fp16-到底选哪个)
+
+### Q9: EP 通信为什么批大小敏感？
 小 batch → 很多专家收到 0 token → 通信占比高 → Wave 调度空 wave 多。大 batch → 负载自然均衡 → 通信被 GEMM 隐藏。
 📖 [Expert Parallelism Q8](topics/expert-parallelism.md#q8-moe-ep-为什么对-batch-大小敏感)
 
@@ -263,6 +289,13 @@ Aux Loss 的梯度与 LM loss 竞争 → 多目标优化的 trade-off → α 难
 | 256 (V3) / 384 (V4) | 路由专家数量 |
 | 8 (V3) / 6 (V4) | 每 token 激活专家数 |
 | 3 层 | V4 Hash MoE 层数（前 3 个 Transformer block） |
+| 1-8-23 / 1-5-10 / 1-8-7 / 1-4-3 / 1-5-2 | 各浮点格式的 (sign, exponent, mantissa) 位分配 |
+| 65504 | FP16 正常数最大值（overflow 阈值，需 loss scaling 的原因） |
+| 448 | FP8 E4M3 正常数最大值 |
+| 14 位 | H800 FP8 Tensor Core 累加精度 |
+| 128 | V3 FP8 GEMM 累加精度提升窗口 |
+| 1×128 / 128×128 | 激活 / 权重 FP8 细粒度量化 tile size |
+| 2× / 4× | FP8 / FP4 相对 BF16 的理论吞吐提升 |
 
 ---
 
@@ -270,7 +303,7 @@ Aux Loss 的梯度与 LM loss 竞争 → 多目标优化的 trade-off → α 难
 
 ```
 1. 基础并行 → TP → PP → DP → ZeRO
-2. 内存优化 → Checkpointing → FP8 → Offload
+2. 内存优化 → 混合精度训练（FP32→BF16→FP8→FP4）→ Checkpointing → Offload
 3. MoE 架构 → GShard → DeepSeekMoE → EP → 负载均衡
 4. 注意力   → FA-2 → GQA/MQA → MLA → Ring Attention
 5. 训练系统 → DualPipe → MegaMoE → 容错
