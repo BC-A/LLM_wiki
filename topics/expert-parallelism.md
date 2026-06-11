@@ -1,750 +1,791 @@
-# Expert Parallelism (EP) 深度面试指南
+# Expert Parallelism (EP)
 
-> 目标岗位：大模型训练 Infra 专家
-> 核心参考：DeepSeek-V4 Technical Report Section 3.1、DeepSeek-V3、Comet、DeepGEMM
-
----
-
-## 一、EP 的数学本质与通信模型
-
-### 1.1 EP 要解决什么问题
-
-MoE 层的参数量与专家数成正比。以 DeepSeek-V4-Pro 为例：
-
-- 384 个路由专家，每个专家包含 SwiGLU 的 gate/up/down 三个矩阵
-- 单个专家参数量 = 3 × h × d_ff = 3 × 7168 × 3072 ≈ 66M 参数
-- 384 个专家总参数 ≈ 25B（仅 MoE 部分）
-- 单卡 H100 (80GB) 装不下
-
-因此必须将不同专家分布到不同 GPU 上——这就是 EP。
-
-### 1.2 通信量的精确计算
-
-MoE 层核心是两次 All-to-All：
-
-**Dispatch（Token → Expert GPU）**：
-```
-输入：每个 rank 持有 batch 中的一部分 token
-操作：将每个 token 的 hidden state 发送到其 top-k 专家所在的 GPU
-输出：每个 rank 收到分配给本地专家的所有 token
-```
-
-**Combine（Expert GPU → Token GPU）**：
-```
-输入：每个 rank 计算完本地专家的输出
-操作：将专家输出发送回 token 原始的 rank
-输出：每个 rank 恢复其原始 batch 顺序
-```
-
-**通信量公式**（per token-expert pair）：
-
-| Stage | 精度 | 每 token-expert 字节数 |
-|-------|------|----------------------|
-| Dispatch (V3) | BF16 | 2h |
-| Dispatch (V4) | FP8 | h |
-| Combine (V3) | BF16 | 2h |
-| Combine (V4) | BF16 | 2h |
-| **V4 合计** | 混合 | **3h** |
-
-### 1.3 计算-通信比的精确推导（核心公式，必须会背）
-
-这是 DeepSeek-V4 论文中最重要的公式之一。
-
-**每个 token-expert pair 的计算量**：
-
-SwiGLU 包含三个矩阵乘法：
-- Gate projection: W_gate ∈ R^{h × d_ff} → 2·h·d_ff FLOPs
-- Up projection: W_up ∈ R^{h × d_ff} → 2·h·d_ff FLOPs
-- Down projection: W_down ∈ R^{d_ff × h} → 2·h·d_ff FLOPs
-- 合计：**6·h·d_ff FLOPs**
-
-**每个 token-expert pair 的通信量**（V4）：
-- FP8 Dispatch: h 字节
-- BF16 Combine: 2h 字节
-- 合计：**3h 字节**
-
-**关键比值**：
-```
-V_comp / V_comm = 6·h·d_ff / 3·h = 2·d_ff
-```
-
-**这导出了通信隐藏条件**：
-
-```
-C / B ≤ V_comp / V_comm = 2·d_ff
-```
-
-其中 C = 峰值算力 (FLOP/s)，B = 互联带宽 (Bytes/s)。
-
-**代入具体数字**：
-
-| 模型 | d_ff | C/B 阈值 (FLOPs/Byte) | 每 GB/s 可隐藏的 TFLOP/s |
-|------|------|----------------------|-------------------------|
-| V4-Flash | 2048 | 4096 | 4.1 |
-| V4-Pro | 3072 | **6144** | **6.1** |
-
-**实际含义**：对于 V4-Pro，每 1 GB/s 的互联带宽可以隐藏 6.1 TFLOP/s 的计算。一旦带宽超过此阈值，再加带宽是浪费。
-
-**面试时建议直接说出**：`C/B ≤ 2d_ff = 6144 FLOPs/Byte`（V4-Pro），然后解释推导过程。
-
-### 1.4 为什么 FP8 Dispatch + BF16 Combine 是混合精度？
-
-这并非随意选择：
-
-- **Dispatch 用 FP8**：token hidden state 作为 GEMM 输入，FP8 对精度不敏感。且 dispatch 通信量占总通信量的 1/3（h 字节 vs 总共 3h），量化收益高。
-- **Combine 用 BF16**：专家输出需要与其他专家的输出做加权求和（routing weights），且要加到 residual stream 上。Combine 结果直接参与后续 Attention 的 QKV 计算，对精度敏感。因此保留 BF16。
-- **等效精度**：这样混合的总通信精度等效于 ~FP12，实际训练无精度损失。
+> **一句话概述**: 将 MoE 层的不同专家分布到不同 GPU 上，通过集合通信在专家间路由 token，突破单卡无法容纳全部专家的显存限制。
+> **核心问题**: 如何在「专家分布的通信开销」与「单卡显存/计算限制」之间取得平衡？
 
 ---
 
-## 二、细粒度 EP：从粗粒度到 Wave 调度的完整推理链
+## 一、为什么需要 EP
 
-### 2.1 为什么需要细粒度
+### 1.1 问题：专家参数太多，单卡放不下
 
-**传统粗粒度 EP** 的执行顺序：
+MoE（Mixture of Experts）用多个「专家」子网络替代普通 FFN，每个 token 只激活其中 top-k 个。这带来巨大的参数膨胀。以 DeepSeek-V3 为例：
+
+- 256 个路由专家 + 1 个共享专家
+- 每个专家包含 SwiGLU 的 gate/up/down 三个矩阵
+- 单个专家参数量 ≈ 3 × h × d_ff ≈ 3 × 4096 × 2048 ≈ 25M
+- 一层 MoE 的总参数量 ≈ 256 × 25M ≈ 6.4B
+
+单卡 H100（80GB）装不下，更不用说训练时还有优化器状态和激活值。因此必须将不同专家分布到不同 GPU 上——这就是 **Expert Parallelism (EP)**。
+
+> EP 解决的是「专家参数太多」的问题，与 TP 解决「单个矩阵太大」是正交的。
+
+### 1.2 MoE 层的前向流程
+
+在进入 EP 的具体机制之前，先明确 MoE 层在整个 Transformer 中的位置和计算步骤：
+
 ```
-时间轴：
-|──── Dispatch All-to-All ────|──── Expert Compute ────|──── Combine All-to-All ────|
-                              通信和计算完全串行
-```
-
-问题：即使总计算时间 > 总通信时间，因为串行执行，通信延迟仍然暴露在关键路径上。
-
-**Comet (Zhang et al., 2025b) 的改进**：
-```
-时间轴：
-|── Dispatch ──|────────────────────────────────────|
-               |── Linear-1 ──|── Linear-2 ──|      |
-                              |── Combine ───|      |
-               Dispatch 和 Linear-1 重叠，Combine 和 Linear-2 重叠
-               理论加速：1.42×
-```
-
-Comet 的问题：重叠粒度仍然太粗。Dispatch 必须全部完成才能开始任何计算，Combine 必须等全部计算完成。
-
-### 2.2 V4 的 Wave 调度：三级流水线
-
-**核心思想**：将 E 个专家均分为 W 个 wave，每个 wave 有 E/W 个专家。
-
-每个 wave 经历三级流水：
-```
-Wave i:   | Dispatch_i | Compute_i | Combine_i |
-Wave i+1:              | Dispatch_{i+1} | Compute_{i+1} | Combine_{i+1} |
-Wave i+2:                               | Dispatch_{i+2} | Compute_{i+2} | ...
-```
-
-**稳态执行（三路并发）**：
-```
-当前 wave 的计算 || 下一 wave 的 Dispatch || 上一 wave 的 Combine
+Input (hidden_states) [B, S, h]
+  │
+  ├─→ Router (Gating Network)
+  │     每个 rank 独立对自己持有的 token 做路由决策
+  │     Router 参数在所有 EP rank 上复制（不切分），因为参数量极小（h × E ≈ 1M）
+  │
+  ├─→ Token Dispatch
+  │     将 token 按路由结果发送到对应专家所在的 rank
+  │
+  ├─→ Expert Compute
+  │     每个 rank 对自己持有的本地专家执行 SwiGLU GEMM
+  │
+  └─→ Token Combine
+        将专家输出发送回 token 原始的 rank，按 routing weights 加权求和
 ```
 
-**关键设计决策——Wave 数量 W 的选择**：
-
-- W 太小（如 W=1）：退化为粗粒度 EP，无重叠
-- W 太大（如 W=E）：每 wave 仅 1 个专家，token 分布可能极不均衡
-- 最优 W：使得每 wave 的计算时间与 Dispatch/Combine 通信时间可比，以实现完美流水线
-
-V4 论文未明确给出 W，但从性能数据可以反推：在 V4-Flash（256 专家）上，理论加速 1.92×（对比 naive 的 1.0× 和 Comet 的 1.42×），说明 W 足够大以实现有效重叠。
-
-### 2.3 为什么 Wave 调度对 RL Rollout 特别有效
-
-RL rollout 场景的特点：
-- **极小 batch**：通常单条或几条 sequence
-- **token 数远小于 expert 数**：很多专家收到 0 token
-- **通信延迟占比极高**：传统 EP 通信开销可能超过计算本身
-
-Wave 调度的增益：
-- 只对有 token 的 wave 做通信和计算
-- 空 wave 直接跳过，无任何开销
-- 因此对小 batch 加速更大（最高 1.96× vs 常规 1.50-1.73×）
+Router 为什么在所有 rank 上复制而不是切分？参数量极小（4096 × 256 ≈ 1M），复制开销可以忽略。如果切分，每个 rank 只知道部分专家的路由分数，需要额外通信来协调 → 得不偿失。
 
 ---
 
-## 三、MegaMoE Mega-Kernel 的实现细节
+## 二、EP 的通信方式：从简单到高效
 
-### 3.1 为什么需要单一融合 Kernel
+知道了 MoE 层需要把 token 分发到对应专家的 GPU，怎么实现？在讨论具体方案之前，先搞清楚三个核心数字——参数量、计算量、通信量。后续所有的设计抉择都源于这三者之间的比例关系。
 
-独立 kernel launch 的问题：
-- 每个 kernel launch 有 CPU→GPU 调度延迟（~5-20μs per launch）
-- 每个 kernel 之间需要全局同步（implicit barrier at kernel boundary）
-- 中间结果需要写回 global memory 再由下一个 kernel 读取
-- GPU SM 在 kernel 边界处空闲
+### 2.1 参数量、计算量、通信量
 
-Mega-Kernel 解决方案：
-- 单一 kernel 内包含全部逻辑：token 重排 → All-to-All → GEMM → SwiGLU → All-to-All → 输出重组
-- 使用 CUDA cooperative groups 或 persistent threads 实现 SM 间协调
-- 中间结果保持 on-chip（shared memory / registers）或通过 SM-to-SM 通信
+先看清数字——后面所有 EP 的设计决策都源于这三者之间的比例。以 **DeepSeek-V4-Pro** 的一个 MoE 层为例：
 
-### 3.2 Pull vs Push Dispatch 的底层原因
-
-V4 选择 **Pull 模式**而非传统的 Push：
-
-**Push 模式**（发送方驱动）：
 ```
-GPU A: "我有 token 要发给 GPU B 的 Expert 3"
-GPU A: cudaMemcpy (or NCCL send) → GPU B
-问题：每个 wave 都需要异步通知 B，B 需要知道数据已就绪
-在 wave 级别（每 wave 可能仅几十 μs），通知延迟成为瓶颈
+h = 7168, d_ff = 3072, num_experts = 384, topk = 6
+FP8 dispatch + BF16 combine（V4 混合精度方案）
 ```
 
-**Pull 模式**（接收方驱动）：
+#### 参数量
+
+每个专家是标准的 SwiGLU MLP，三个权重矩阵：
+
 ```
-GPU B: "我负责 Expert 3, 5, 7, 我需要从其他 GPU 拉取发给这些 expert 的 token"
-GPU B: cudaMemcpy (从 GPU A) ← GPU A 的内存
-好处：B 自己控制节奏，不需要显式通知，通信发起方与计算方是同一个 GPU
+W_gate: [h, d_ff] = [7168, 3072] → 22M 参数
+W_up:   [h, d_ff] = [7168, 3072] → 22M 参数
+W_down: [d_ff, h] = [3072, 7168] → 22M 参数
+──────────────────────────────────────
+单个专家 ≈ 66M 参数
+一层 MoE ≈ 384 × 66M ≈ 25.3B 参数
 ```
 
-Pull 模式之所以可行，是因为：
-- 路由结果（token → expert 映射）在 EP 组内是确定的
-- 每个 GPU 知道哪些专家在本地，可以精确计算需要从哪些 rank 拉多少 token
-- 计算方主动拉取 = 零通知延迟
+对比 Attention 层（QKV + output 投影 ≈ 4·h² ≈ 205M 参数），MoE 层的参数量是它的 ~120 倍。单卡 H100 80GB 装不下——即使只存 BF16 权重也需要 25.3B × 2 bytes ≈ 50GB，还没算优化器状态和激活值。这就是 EP 存在的根本原因。
 
-### 3.3 Wave Quantization（波次量化）问题
+#### 计算量
 
-这是一个容易被忽略但实际很重要的工程问题。
+每个 token 只激活 topk=6 个专家，每次激活走完整的 SwiGLU 路径（gate/up 矩阵乘 + 激活 + down 矩阵乘）：
 
-**定义**：当最后一波（tail wave）的 token 数不满足完整的 wave 大小时，GPU SM 利用率下降，出现「尾波量化」损失。
+```
+每个 token-expert pair:
+  3 个 GEMM × 2·h·d_ff = 6·h·d_ff = 6 × 7168 × 3072 ≈ 132M FLOPs
 
-**产生原因**：
-- 每 wave 的 token 数 = total_tokens / W，通常不是 SM 数（或 wave 内 GEMM tile 数）的整数倍
-- 最后一波可能只有部分 tile 有实际计算，其余 tile 空转
-- 小 batch 下尤其严重（total_tokens 本身就小）
+每个 token（topk=6）:
+  6 × 132M ≈ 792M FLOPs
+```
 
-**V4 的解决方案**（Section 3.3）：
-- **双核策略**：
-  1. 满波用「单 SM 核」：整个 GEMM 由一个 SM 完成，确保满波吞吐（避免 split-k 导致的 batch 不变性问题）
-  2. 尾波用「多 SM 核」：多个 SM 并发处理，降低尾波延迟
-- 精心设计的累加顺序确保两种核的结果 bit-identical
+对比 Attention 层每 token 约 `4·h² = 205M` FLOPs，MoE 层的计算量约是它的 4 倍。但因为只有 6/384 ≈ 1.6% 的专家被激活，这些计算是**稀疏的**——每个 token 只触及了模型的一小部分。
+
+#### 通信量
+
+每个 token 需要在 Dispatch 时把 hidden state 发给 topk 个专家所在的 rank，Combine 时把结果收回来做加权聚合：
+
+```
+Dispatch（FP8，1 byte/element）:
+  per token-expert: h × 1 = 7168 bytes ≈ 7KB
+  per token:        topk × 7KB = 6 × 7KB = 42KB
+
+Combine（BF16，2 bytes/element，精度敏感保留高精度）:
+  per token-expert: h × 2 = 14336 bytes ≈ 14KB
+  per token:        topk × 14KB = 6 × 14KB = 84KB
+  ─────────────────────────────────────────
+  per token 总通信量: 42KB + 84KB = 126KB
+```
+
+**为什么 Dispatch 用 FP8 而 Combine 用 BF16？Dispatch 发的 token hidden state 是 GEMM 的输入，对精度相对宽容；Combine 发回的专家输出要做加权求和并加到 residual stream 上，对精度敏感。** 一省一保，这是 V4 混合精度通信的核心权衡。
+
+#### 计算-通信比：决定 EP 是瓶颈还是可隐藏
+
+##### 1. 模型侧：单token-expert配对的计算/通信配比
+先算出一组token分配给单个专家时，对应的总计算量与总传输数据量：
+```
+# 单次配对浮点运算总量
+V_comp = 6·h·d_ff = 6 × 7168 × 3072 ≈ 132M FLOPs
+
+# 单次配对双向通信总字节数
+V_comm = h(FP8权重) + 2h(BF16激活梯度) = 3h = 21504 bytes
+```
+两者做比值，消去隐藏参数h，得到模型固有的**计算通信负荷比**：
+```
+Load_Ratio = V_comp / V_comm = (6·h·d_ff) / 3h = 2·d_ff
+代入d_ff=3072：Load_Ratio = 2 × 3072 = 6144 FLOP/Byte
+```
+这个比值含义：模型业务本身约束——**每1字节跨卡传输数据，配套必须完成6144次浮点运算**。
+这个数值代表通信背后绑定的计算工作量，数值越大，同等通信量下计算任务越繁重。
+
+##### 2. 硬件侧：算力带宽供给能力比
+V4专家层GEMM采用FP8精度计算，硬件算力`C`取FP8峰值算力；
+All-to-All为双向收发并行传输，带宽`B`取双向聚合总带宽。
+定义硬件**算力供给比** `Supply_Ratio = C/B`：代表硬件每1Byte/s带宽，一秒内最多能同步支撑多少FLOP/s的计算。
+
+| 硬件链路 | C (FP8峰值算力) | B (双向聚合带宽) | Supply_Ratio=C/B (FLOP/Byte) |
+|--------|----------------|-----------------|-----------------------------|
+| H100 NVSwitch 节点内NVLink | ~2 PFLOP/s | ~900 GB/s | ~2200 |
+| InfiniBand NDR 跨节点单网卡 | ~2 PFLOP/s | ~50 GB/s | ~40000 |
+
+##### 掩盖判定核心逻辑
+想要**GEMM计算完全掩盖通信延迟**，需要满足：硬件一秒每字节带宽能供给的算力 ≤ 模型每字节通信绑定的计算量
+也就是判定公式：
+$$\boldsymbol{\frac{C}{B} \le 2\cdot d_{ff}}$$
+通俗解释：
+硬件算力的“供给速度”追不上模型计算的“任务负荷”，传输数据的耗时足够GPU完整跑完配套计算，GPU不会空闲等待数据。
+**数字越大 = GPU 计算速度相对传输速度快得越多，越容易算完等通信；
+数字越小 = 传输速度跟得上计算速度，不容易卡通信。**
+
+##### 3. V4-Pro（d_ff=3072）瓶颈判定
+模型负荷阈值：$2d_{ff}=6144$
+- 节点内NVLink：2200 ≤ 6144 ✅
+  硬件供给算力远小于模型负荷，通信耗时被GEMM完全隐藏，节点内EP通信无性能瓶颈
+- 跨节点IB：40000 > 6144 ❌
+  硬件算力供给过剩、带宽速度跟不上算力，GPU快速算完一批数据后，必须空转等待All-to-All传输，跨节点通信成为硬性瓶颈
+
+这就是V3设计DualPipe、V4设计Wave流水线调度的底层根源：跨节点IB带宽算力匹配度极差，只能依靠多层流水线，异步重叠All-to-All通信与GEMM计算，分摊屏蔽通信延迟。
+
+##### 4. V4-Flash（d_ff=2048）对比验证
+更小的中间维度，模型计算负荷同步降低：
+负荷阈值：$2d_{ff}=2\times2048=4096$
+- NVLink：2200 ≤ 4096 ✅ 依旧可以完全隐藏通信
+- IB：40000 ≫ 4096 ❌ 瓶颈问题反而加剧
+
+规律总结：
+$d_{ff}$ 数值越大 → 同等通信量绑定的计算量越重 → 计算耗时更长、更容易盖住传输等待；
+大d_ff宽FFN结构的模型，天然更适配多机跨节点EP并行训练。
+
+##### 补充延伸
+EP并行里的All-to-All、DualPipe、Wave调度三类通信方案，核心取舍逻辑一致：在不同专家并行规模、不同链路带宽约束下，权衡**额外冗余计算开销**和**全局通信总传输量**，找到整体吞吐最优平衡点。
+
+下面三种通信方式，本质上是在不同的 EP 规模和 bandwidth 约束下，如何在「冗余计算」和「通信量」之间做权衡。
+
+### 2.2 方式一：AllGather（最简单，但浪费计算）
+
+最直观的思路：既然每个 rank 都不知道其他 rank 的 token 要去哪个专家，那就**让所有 rank 看到所有 token**。
+
+```
+AllGather 方式:
+
+  Rank 0                    Rank 1                    Rank 2
+  [token_a, token_b]       [token_c, token_d]       [token_e, token_f]
+       │                        │                        │
+       └──────── AllGather ─────┼────────────────────────┘
+                                │
+              每个 rank 都有 [token_a, b, c, d, e, f]
+                                │
+              每个 rank 只算自己负责的专家
+              Rank 0: Expert 0..15 处理 token_a, c（只取路由到这些专家的）
+              Rank 1: Expert 16..31 处理 token_b, d, e
+                                │
+       ┌──────── ReduceScatter ─┴────────────────────────┐
+       │                        │                        │
+  Rank 0                    Rank 1                    Rank 2
+  [expert_out_a,c]         [expert_out_b,d,e]        [expert_out_f]
+```
+
+**优点**：实现简单，用标准的 AllGather + ReduceScatter 就能完成。
+
+**致命问题**：每个 rank 收到的都是**所有 token**，只是每个 rank 只计算其中路由到本地专家的那部分。当 EP 较大时（如 ep_size=64），每个 rank 只负责 1/64 的专家，但处理了 100% 的 token → 99% 的计算是无效的。
+
+**适用场景**：EP 很小（≤4）时还能接受，通信简单、kernel 成熟。
+
+在 Megatron-LM 中这就是 `moe_token_dispatcher_type="allgather"`（也是默认值）。
+
+### 2.3 方式二：All-to-All（按需路由，EP 的标配）
+
+改进思路：**只把 token 发给真正需要它的 rank**。
+
+```
+All-to-All 方式:
+
+  Rank 0                    Rank 1                    Rank 2
+  [token_a→Expert 5]       [token_c→Expert 20]      [token_e→Expert 0]
+  [token_b→Expert 18]      [token_d→Expert 35]      [token_f→Expert 18]
+       │                        │                        │
+       │  Expert 0..15 在 Rank 0, Expert 16..31 在 Rank 1, Expert 32..47 在 Rank 2
+       │
+       └──────── All-to-All ────┼────────────────────────┘
+                                │
+  Rank 0 收到: token_a(E5) + token_e(E0)          ← 只收到路由到本地专家的
+  Rank 1 收到: token_b(E18) + token_c(E20) + token_f(E18)
+  Rank 2 收到: token_d(E35)
+                                │
+              每个 rank 计算本地专家
+              Rank 0: Expert 0 处理 token_e, Expert 5 处理 token_a
+              Rank 1: Expert 18 处理 token_b+token_f, Expert 20 处理 token_c
+                                │
+       ┌──────── All-to-All ────┴────────────────────────┐
+       │                        │                        │
+  Rank 0                    Rank 1                    Rank 2
+  [结果聚合回原顺序]        [结果聚合回原顺序]        [结果聚合回原顺序]
+```
+
+「只发给需要的 rank」意味着发送方和接收方之间的数据量是**不均匀的**——这正是 All-to-All 的语义：每个 rank 向不同 rank 发送**不同数量**的数据。
+
+#### All-to-All vs All-Reduce：为什么不能用 All-Reduce？
+
+这个问题经常被问到。两种集合通信的语义完全不同：
+
+| 维度 | All-to-All | All-Reduce |
+| ---- | ---------- | ---------- |
+| **做什么** | 数据重新分布（redistribution） | 数据聚合（aggregation） |
+| **每个 rank 得到** | 来自各 rank 的**不同数据片段** | 所有 rank 数据的**求和/平均结果** |
+| **数据量变化** | 总量不变，重新分配 | 归约后数据量减少 |
+| **典型场景** | EP dispatch/combine、SP attention | DP 梯度同步、TP 矩阵乘结果聚合 |
+
+EP 用 All-Reduce 会发生什么？所有 rank 的 token hidden states 会被求和 → 不同 token 的数据被混在一起 → 完全破坏 token 独立性。EP 需要的是「把我的数据发给正确的人，不是求和」。
+
+#### 两步 All-to-All：Dispatch + Combine
+
+EP 需要两次 All-to-All：
+
+- **Dispatch**：token → expert rank（把每个 token 的 hidden state 发到其 top-k 专家所在的 GPU）
+- **Combine**：expert rank → token rank（把专家输出发回 token 原来所在的 GPU，做加权聚合）
+
+**通信量**（per token-expert pair）：
+
+| 阶段 | BF16 | FP8 |
+|------|------|-----|
+| Dispatch | 2h 字节 | h 字节 |
+| Combine | 2h 字节 | h 字节 |
+| **合计** | **4h 字节** | **2h 字节** |
+
+通信能否被 GEMM 掩盖，取决于硬件的 C/B 是否满足 §2.1 推导的 `C/B ≤ 2·d_ff`。结论是：节点内 NVLink 下 EP 通信不是瓶颈，跨节点 IB 是——所以 DualPipe（V3）和 Wave 调度（V4）的核心目的都是**跨节点时把 All-to-All 和 GEMM 重叠起来**，隐藏 IB 的带宽短板。
+
+节点内 NVLink 下通信不是瓶颈；跨节点 IB 必须靠 DualPipe 或 Wave 调度来重叠。
+
+### 2.4 方式三：Flex / Fused（消除中间搬运）
+
+All-to-All 解决了计算冗余，但它自身还有一个隐藏开销：**permute（重排）**。
+
+为什么需要重排？来看 Dispatch 前的实际数据布局：
+
+```
+Rank 0 有 4 个 token，路由结果:
+  A → Expert 5  (在 Rank 1)
+  B → Expert 20 (在 Rank 1)
+  C → Expert 3  (在 Rank 0)
+  D → Expert 35 (在 Rank 2)
+
+当前 tensor 顺序: [A, B, C, D]           ← 按 token 索引排列
+All-to-All 需要:  [C, A, B, D]           ← 按目标 rank 分组
+                  └Rank0┘ └─Rank1─┘ └Rank2┘
+
+所以需要一次 permute，把数据从「token 顺序」重排为「目标 rank 顺序」。
+```
+
+收到数据后也一样——接收方拿到的 tensor 是按**源 rank** 分组的，但本地专家需要按 **expert ID** 组织 token：
+
+```
+Rank 1 收到:  [A(from Rank0), B(from Rank0), E(from Rank2)]
+               └── 按源 rank 排列 ──┘
+
+但本地 Expert 20 需要 [B, E]，Expert 18 需要 [A]
+→ 需要再 permute 一次
+```
+
+**传统做法（三个独立 kernel）**：
+
+```
+permute → All-to-All → permute
+  ↑          ↑           ↑
+  Kernel1    Kernel2     Kernel3
+  写HBM      写HBM       写HBM
+```
+
+每个 kernel 的结果都写回 HBM，下一个 kernel 再读出来。两次 permute 的数据只是中间状态，对用户毫无意义，却各占了一次 HBM 读写。
+
+**Flex 的做法（融合单个 kernel）**：
+
+```
+┌──────────── 单个 kernel ────────────┐
+│                                      │
+│  HBM → 读入 → [shared mem 重排]      │
+│                → [shared mem A2A]    │
+│                → [shared mem 重排]   │
+│                → 写出 → HBM          │
+│                                      │
+│  中间数据始终在 on-chip shared mem   │
+└──────────────────────────────────────┘
+```
+
+融合后，permute 的中间结果不写 HBM，在 shared memory 里流转。好处有两个：
+1. 省了两次 HBM 读写（HBM 带宽是 GPU 最稀缺的资源之一）
+2. 省了两次 kernel launch（每次 launch 有 ~5-20μs 的 CPU→GPU 调度延迟）
+
+Megatron-LM 中 `moe_token_dispatcher_type="flex"` 对应这种方式，底层由 **DeepEP** 或 **HybridEP** 提供融合 kernel。
+
+> DeepEP 的实现细节见下文第五节。
+
+### 三种方式的选择建议
+
+| 方式 | Megatron 参数 | 何时用 |
+|------|-------------|--------|
+| AllGather | `allgather` | EP ≤ 4，快速原型 |
+| All-to-All | `alltoall` | EP ≥ 8，训练标配 |
+| Flex (Fused) | `flex` | H100+，大规模训练，追求极致性能 |
+
+> **关键认知**：方式一到方式三的演进，本质是逐步消除**不必要的数据搬运**——AllGather 搬运了不需要的 token，分离的 All-to-All 搬运了中间状态的 permute 结果，Flex 连中间结果都不写了。
 
 ---
 
-## 四、EP 下的负载均衡：从 Aux Loss 到无辅助损失
+## 三、Megatron-LM 中怎么配 EP
 
-### 4.1 为什么 Auxiliary Loss 有问题
+理解原理后，来看 Megatron-LM 中 EP 是怎么配置和运作的。
 
-传统 MoE（如 GShard, Switch Transformer）：
-```
-Loss = LM_Loss + α × Load_Balance_Loss
-Load_Balance_Loss = E × Σ_i (f_i × P_i)
-其中 f_i = fraction of tokens routed to expert i
-     P_i = average routing probability for expert i
-```
+> 代码路径：[/home/jsy/LLM/training-frameworks/Megatron-LM](https://github.com/NVIDIA/Megatron-LM)
 
-问题：
-- α 是超参，需要调。α 太小 → 负载不均衡，token dropping 严重；α 太大 → 损害 LM 性能
-- 辅助损失和 LM 损失存在竞争，本质上是多目标优化的 trade-off
-- 训练初期路由不成熟时，Aux Loss 可能引导路由到次优状态
+### 3.1 基本参数
 
-### 4.2 DeepSeek 无辅助损失策略的完整机制
+EP 的配置分布在两个核心类中：
 
-**Step 1**：计算原始路由亲和分数
-```
-s_i = Sqrt(Softplus(W_route · x))  // V4 用 Sqrt(Softplus)，V3 用 Sigmoid
+**`ModelParallelConfig`** 定义 EP 并行度：
+
+```python
+# megatron/core/model_parallel_config.py
+expert_model_parallel_size: int = 1
+"""将 MoE 专家分布到 expert model parallel group 的 GPU 上"""
+
+expert_tensor_parallel_size: Optional[int] = None  # 默认 = tensor_model_parallel_size
+"""专家层的张量并行大小，可以和 attention 层的 TP 不同"""
 ```
 
-为什么 V4 改为 Sqrt(Softplus)？
-- Sigmoid 在饱和区梯度消失，路由训练慢
-- Softplus 是 ReLU 的平滑版本，梯度更健康
-- Sqrt 压缩大值，防止少数 token 的亲和分数过大主导路由
+**CLI 完整示例**：
 
-**Step 2**：加 per-expert bias
+```bash
+# 核心并行度
+--tensor-model-parallel-size 2       # Attention/Embedding 的 TP
+--expert-model-parallel-size 8       # EP 并行度
+--expert-tensor-parallel-size 2      # 专家层的 TP（默认等于上面那个）
+--pipeline-model-parallel-size 2     # PP
+
+# MoE 架构
+--num-experts 64                     # 专家总数（必须能被 ep_size 整除）
+--moe-router-topk 8                  # 每 token 激活的专家数
+--moe-ffn-hidden-size 2048           # 专家 FFN 隐藏层维度
+
+# Token 分发方式
+--moe-token-dispatcher-type alltoall # allgather / alltoall / flex
+--moe-enable-deepep                  # 启用 DeepEP（flex 模式需要）
 ```
-s'_i = s_i + b_i
+
+### 3.2 专家到 Rank 的分配
+
+专家按**连续分块**分配到各 EP rank：
+
+```python
+# megatron/core/transformer/moe/moe_layer.py
+ep_size = get_pg_size(self.ep_group)
+ep_rank = get_pg_rank(self.ep_group)
+self.num_local_experts = self.config.num_moe_experts // ep_size
+local_expert_indices_offset = ep_rank * self.num_local_experts
+self.local_expert_indices = [local_expert_indices_offset + i
+                             for i in range(self.num_local_experts)]
 ```
-其中 b_i 是每个专家独立的可学习/可调偏置。
 
-**Step 3**：Top-K 选择
-```
-selected_experts = TopK({s'_i | i ∈ all_routed_experts}, k)
-```
+例如 `num_experts=64, ep_size=4` → Rank 0 持有专家 0-15，Rank 1 持有 16-31，依此类推。
 
-**Step 4**：偏置更新（非梯度更新！这是关键）
-
-不通过反向传播更新 b_i，而是基于负载统计直接调整：
-```
-if expert_i_overloaded:
-    b_i -= η_bias  // 减少该专家的 bias，降低后续被选中的概率
-elif expert_i_underloaded:
-    b_i += η_bias  // 增加该专家的 bias，提高后续被选中的概率
-```
-其中 η_bias = 0.001（V4 超参），更新频率通常为每 step。
-
-**关键区分**：b_i 的更新走的是启发式规则，**不参与梯度计算**。这意味着负载均衡信号和 LM 优化信号完全解耦。
-
-### 4.3 序列级平衡损失
-
-V4 在无辅助损失基础上增加了 lightweight 的序列级平衡损失（权重 0.0001）：
-
-作用：防止单条长序列内部出现极端不均衡（如某条 64K 序列的所有 token 都路由到某几个专家）。
-
-为什么需要？因为 per-expert bias 是全局统计量，无法感知单序列内的分布异常。
+**约束**：
+- `ep_size ≤ num_experts`（每 rank 至少 1 个专家）
+- `num_experts % ep_size == 0`（Megatron-LM 硬性要求）
+- 实践中每个 rank 通常持有 **1-4 个专家**——多了计算太粗（不利于负载均衡），少了通信占比太高
 
 ---
 
-## 五、EP + ZeRO + DP 的混合并行：梯度同步细节
+## 四、EP 如何与其他并行维度组合
 
-### 5.1 并行维度布局
+真实训练中不可能只用 EP 一种并行。这一节串起来讲 EP 和 TP / DP / CP / PP 组合时的**行为、约束和性能考量**。每种组合自然会引出它需要的进程组。
 
-DeepSeek V4 的典型并行配置：
+### 4.0 从 Attention 进程组到 MoE 进程组：EP 切在哪
+
+Megatron-LM 内部有两套进程组，分别服务于 Attention 层和 MoE 层。两套进程组**用同一批物理 GPU**（同一个 `world_size`），但分组方式不同。理解两层之间的映射关系，是掌握混合并行的起点。
+
+#### Attention 进程组
+
+这是不含 EP 的进程组，Megatron 中由 `decoder_rank_generator` 建：
+
 ```
-Total GPUs = DP × TP × PP × EP
-```
-
-- **DP (Data Parallel)**：同一组参数在不同的 DP rank 上处理不同的 micro-batch
-- **TP (Tensor Parallel)**：单层内的矩阵乘法切分到多个 GPU
-- **PP (Pipeline Parallel)**：不同层放在不同 GPU，用 DualPipe 1F1B 调度
-- **EP (Expert Parallel)**：不同专家在不同 GPU
-
-### 5.2 梯度同步的三条路径
-
-**路径 1：稠密参数（Attention, Embedding, Norm）**
-```
-存储方式：ZeRO-1/2 分片在 DP 维度
-同步方式：reduce-scatter → all-gather（标准 ZeRO）
-精度：FP32
+world_size = TP × PP × CP × DP_attn
 ```
 
-**路径 2：MoE 专家参数**
-```
-存储方式：EP 维度上每个 rank 持有不同专家
-同步方式：DP 维度上的梯度需要 all-reduce
-精度：BF16 随机舍入 + All-to-All + 本地 FP32 求和（两阶段规约）
-```
+四个维度都是用户通过 CLI 显式指定的（TP、PP、CP），`DP_attn` 由 `world_size / (TP × PP × CP)` 自动算出。
 
-**路径 3：Muon 特殊处理**
+#### MoE 进程组
+
+引入了 EP，由 `expert_decoder_rank_generator` 建：
+
 ```
-Muon 需要完整的梯度矩阵（不能切分），与 ZeRO 冲突
-解决方案：限制 ZeRO 并行度上限 + 背包算法均衡分配
-         + 同形状参数合并批处理 Newton-Schulz
-         + 超出限制的 DP group 做冗余 Muon 更新
+world_size = expert_TP × PP × EP × DP_expert
 ```
 
-### 5.3 两阶段梯度规约的细节
+这里 CP 固定为 1（MoE 进程组中没有 CP 维度）。
 
-传统做法（有问题）：
+| 维度 | 来源 | 说明 |
+|------|------|------|
+| `PP` | 与 Attention 进程组相同 | 流水线 stage 不变，同一 stage 内的 Attention 和 MoE 层必须同组 |
+| `expert_TP` | CLI `--expert-tensor-parallel-size`，**默认等于 TP** | 专家层的张量并行度。如果不显式指定，就取 `TP` 的值。可以设得比 TP 小（如 TP=4 但 expert_TP=1，专家层不做张量切分） |
+| `EP` | CLI `--expert-model-parallel-size` | 用户显式指定，必须满足 `num_experts % EP == 0` |
+| `DP_expert` | 自动算出 `world_size / (expert_TP × PP × EP)` | 专家层的数据并行度，不单独配置 |
+
+#### EP 到底从哪「切」出来的
+
+两套进程组用同一批 GPU，所以：
+
 ```
-All-Reduce (FP32) → 精确但通信量大
-All-Reduce (BF16) → 通信量小但累加误差大（低精度加法树）
+TP × PP × CP × DP_attn  =  expert_TP × PP × EP × DP_expert
 ```
 
-V4 的两阶段方案：
+消掉两边的 `PP`（相同），并假设 `expert_TP = TP`（最常见的默认情况）：
+
 ```
-Phase 1: All-to-All 交换 BF16 梯度（不累加，仅交换）
-Phase 2: 各 rank 本地 FP32 求和
+CP × DP_attn  =  EP × DP_expert
 ```
 
-为什么这比 All-Reduce 更好？
-- All-Reduce 的 ring/tree 算法中，每跳都在低精度累加 → 误差传播
-- All-to-All + 本地求和 → 只有一次低精度传输，精度损失最小
-- 对于 MoE 梯度，All-to-All 天然与 EP 通信模式匹配（Expert 参数已经分布在 EP rank 上）
+**这就是 EP 的来源：EP 是从 `CP × DP_attn` 这个「池子」里分出来的。** 当 `CP = 1` 时，退化为 `DP_attn = EP × DP_expert`——EP 直接切 `DP_attn`。
 
-### 5.4 Muon + ZeRO 的背包算法
+#### 用一个具体的并行配置走一遍
 
-问题：Muon 需要完整矩阵做 Newton-Schulz 正交化，但 ZeRO 按元素切分。
+**配置**: `TP=2, PP=1, CP=2, EP=4`，`expert_TP` 不设（默认等于 TP），32 张 GPU。
 
-V4 的方案：
-- 设定 ZeRO 并行度上限（每个 rank 最多管 5 个参数矩阵）
-- 把稠密参数按形状分组，用**背包算法**分配到各 ZeRO rank
-- 目标是让各 rank 的参数总量均衡
-- Padding 到相同大小以便 reduce-scatter
-- 额外内存开销 < 10%
+```
+Attention 进程组:  32 = 2(TP) × 1(PP) × 2(CP) × 8(DP_attn)
+MoE 进程组:       32 = 2(expert_TP) × 1(PP) × 4(EP) × 4(DP_expert)
 
-对于超出 ZeRO 规模的 DP group：
-- 在这些 group 上**冗余计算** Muon 更新
-- 用额外计算换内存（典型的 compute-memory trade-off）
+验证: CP × DP_attn = 2 × 8 = 16,  EP × DP_expert = 4 × 4 = 16  ✓
+```
+
+在这 32 张 GPU 上，**同一批 GPU 在 Attention 层和 MoE 层被编入不同的进程组**：
+
+```
+32 GPU, TP=2, CP=2, EP=4
+
+Attention 层 (TP×CP=4 GPU/组, DP_attn=8 组):
+  [0,1]  [2,3]  │  [4,5]  [6,7]  │  [8,9] [10,11] │ [12,13] [14,15] │ ...
+   TP0    TP1    │   TP2    TP3    │   TP4    TP5   │   TP6    TP7    │
+  └── CP0 ──┘   │  └── CP1 ──┘    │  └── CP2 ──┘  │  └── CP3 ──┘   │
+  └───── DP0 ───┘ └───── DP1 ────┘ └───── DP2 ───┘ └───── DP3 ───┘  ...
+
+MoE 层 (TP×EP=8 GPU/组, DP_expert=4 组):
+  [0,1]  [2,3]  [4,5]  [6,7]  │  [8,9] [10,11] [12,13] [14,15]  │ ...
+   TP0    TP1    TP2    TP3    │   TP4    TP5     TP6     TP7    │
+  └────────── EP0 ──────────┘  │  └──────────── EP1 ──────────┘ │
+  └────────── DP0 ──────────┘  ┘  └──────────── DP1 ──────────┘ ┘
+```
+
+**关键变化**：进入 MoE 层时，CP 消失（MoE 进程组中 CP=1），替换为 EP=4。Attention 的 `CP × DP_attn = 16` 个「数据+序列分片」被重新组织为 MoE 的 `EP × DP_expert = 16` 个「专家+数据分片」。EP 吃掉的就是原来 CP 和 DP_attn 的份额。
+
+#### Rank Order：为什么 TP 必须排在最前面
+
+上面说两套进程组用同一批 GPU 但分组不同，具体怎么「分组」是由 `order` 参数控制的。Megatron 默认 `order = "tp-cp-ep-dp-pp"`，这个顺序直接决定了**哪些 GPU 物理上更近，通信更快**。
+
+RankGenerator 的核心公式（[`generate_masked_orthogonal_rank_groups`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py#L251)）：
+
+```
+global_rank = 最内层 + 次内层 × size_最内层 + 次外层 × size_最内层 × size_次内层 + ...
+```
+
+以 `order = "tp-cp-ep-dp-pp"`、`size = [2, 1, 1, 4, 2]` 为例（即 TP=2, CP=1, EP=1, DP=4, PP=2，Attention 网格）：
+
+```
+global_rank = tp_rank + dp*tp + pp*tp*dp
+```
+
+这意味着 **TP 的 stride 是 1，DP 的 stride 是 tp_size，PP 的 stride 是 tp_size × dp_size**。结果就是：
+
+```
+TP 组：GPU 0,1 在一起 → 相邻 GPU，NVLink 直连 → 带宽 ~900 GB/s
+DP 组：GPU 0,2,4,6 在一起 → 跨节点（如果 DP > 每节点 GPU 数）→ 走 IB → 带宽 ~50 GB/s
+PP 组：GPU 0,8 在一起 → 跨节点 → 走 IB
+```
+
+**排在前面的维度，通信落在同一 NVLink 域内**——这就是为什么 TP、CP 必须排前面（带宽需求极高），DP、PP 排后面（对带宽不敏感，跨几跳也行）。
+
+对于 MoE 层，Expert RankGenerator 的 order 是 `"tp-ep-dp-pp"`（CP=1，EP 顶上 CP 的位置）：
+
+```
+Attention:  tp (最内) → cp → dp → pp (最外)
+MoE:        tp (最内) → ep → dp → pp (最外)
+```
+
+**EP 排在了 CP 的位置，也就是第二内层**。这意味着当 EP ≤ 每节点 GPU 数时，EP 的 All-to-All 完全在节点内走 NVLink，延迟极低；一旦 EP 超过该值，EP 组跨越节点，部分通信走 IB，延迟上升。这和 TP 不能超过每节点 GPU 数是同一个约束来源。
+
+#### 几个由公式导出的工程约束
+
+- **TP ≤ 单节点 GPU 数（通常 8）**：TP 通信是 All-Reduce 走 NVLink。如果 TP 组跨越节点边界，部分通信走 IB → 带宽从 ~900 GB/s 掉到 ~50 GB/s → 极慢。
+- **EP 的上限受 `CP × DP_attn` 约束**：`EP = (CP × DP_attn) / DP_expert`，`DP_expert` 至少为 1 → `EP ≤ CP × DP_attn`。GPU 总数固定的情况下，EP 不能无限增大。
+- **EP 增大 → DP_expert 减小 → expert 层 micro-batch 变小 → GEMM 效率下降**。这跟 DP 减小导致计算效率下降是同一个道理。
+- **CP 和 EP 没有直接冲突**，但都会挤占 `DP_expert` 的「预算」。
+
+### 4.1 EP + TP：权重到底怎么切
+
+EP 和 TP 经常一起开，但它们切的是完全不同的东西。
+
+#### EP 不切权重，只分专家
+
+EP 做的事很简单：把 E 个专家按索引连续分块，分给不同 rank。权重本身是完整的——EP Group 0 的 rank 持有 Expert 0..E/EP-1 的**完整**矩阵，EP Group 1 持有下一批，依此类推。EP 本身不做任何矩阵切分。
+
+#### TP 切权重，跟 Attention 层一样
+
+TP 切的是单个专家内部的权重矩阵。SwiGLU 专家有三个矩阵，以 `h = 4096, d_ff = 1536` 为例：
+
+```
+Expert k 的完整权重（无 TP）:
+  W_gate: [h, d_ff] = [4096, 1536]
+  W_up:   [h, d_ff] = [4096, 1536]
+  W_down: [d_ff, h] = [1536, 4096]
+```
+
+开启 TP=2 后，切分方式和 Megatron 的 Attention 层完全一致——**gate/up 列切，down 行切**：
+
+```
+TP 列切（W_gate, W_up）—— 切 dim 1，即 d_ff:
+  Rank 0: [h, d_ff/TP] = [4096, 768]    ← 列前半
+  Rank 1: [h, d_ff/TP] = [4096, 768]    ← 列后半
+
+TP 行切（W_down）—— 切 dim 0，即 d_ff:
+  Rank 0: [d_ff/TP, h] = [768, 4096]    ← 行前半
+  Rank 1: [d_ff/TP, h] = [768, 4096]    ← 行后半
+```
+
+为什么 gate/up 列切、down 行切？因为 SwiGLU 的计算是 `down( gate(x) ⊙ up(x) )`。gate 和 up 的输出在 d_ff 维度上做 element-wise 乘，所以它们在 d_ff 维度上列切之后，每个 TP rank 独立做激活，不需要通信。Down 的输入是激活后的 d_ff 维度 → 行切匹配。
+
+#### EP + TP 叠加时，每个 rank 上是什么
+
+设 `EP=2, TP=2, num_experts=4`。EP 先把专家分两半，TP 再把每半里的专家矩阵切分：
+
+```
+GPU 0 (EP rank 0, TP rank 0):  持有 Expert 0,1 的以下部分:
+  W_gate[0][4096, 768]  W_up[0][4096, 768]  W_down[0][768, 4096]
+  W_gate[1][4096, 768]  W_up[1][4096, 768]  W_down[1][768, 4096]
+
+GPU 1 (EP rank 0, TP rank 1):  持有 Expert 0,1 的另一半:
+  W_gate[0][4096, 768]  W_up[0][4096, 768]  W_down[0][768, 4096]
+  W_gate[1][4096, 768]  W_up[1][4096, 768]  W_down[1][768, 4096]
+
+GPU 2 (EP rank 1, TP rank 0):  持有 Expert 2,3:
+  （同上结构，只是 Expert 索引不同）
+
+GPU 3 (EP rank 1, TP rank 1):  持有 Expert 2,3 的另一半:
+```
+
+**EP 和 TP 是嵌套关系**：先 EP 决定哪个 rank 管哪些专家，再 TP 决定每个专家的矩阵怎么切。不同 EP group 之间没有任何权重共享。
+
+#### 通信流程
+
+一个 token 路由到 Expert 0（在 EP Group 0）的完整路径：
+
+```
+Token 在 GPU 2, hidden = [1, 4096]
+
+Dispatch:
+  → All-to-All (EP):     发到 EP Group 0 (GPU 0,1)
+  → AllGather (TP):       GPU 0,1 各自拿到对方收到的 token（需要处理同一批 token）
+  → GEMM:                 GPU 0: [1,4096]×W_gate[0][4096,768] → [1,768] partial
+                          GPU 1: [1,4096]×W_gate[0][4096,768] → [1,768] partial
+
+Combine:
+  → ReduceScatter (TP):   两个 partial 求和 → 完整 [1,4096]
+  → All-to-All (EP):      发回 GPU 2
+```
+
+EP 通信让 token 到达正确的专家组，TP 通信让同一专家组内的不同 rank 协力完成 GEMM。
+
+#### `expert_tp_size` 可以 ≠ `tp_size`
+
+Megatron-LM 允许专家层使用不同于 Attention 层的 TP 大小（默认相等）。例如 DeepSeek-V3：Attention 用 TP=4，但 MoE 层有 256 个专家、EP=64，每 rank 只持有 256/64 = 4 个专家，单个专家矩阵不大 → `expert_tp_size=1`，专家层不做 TP，只有 EP 通信。
+
+### 4.2 EP + DP：Expert Data Parallel
+
+当 EP 开了之后，**同一套专家参数可能出现在多个 DP rank 上**（除非 `EP == num_experts` 即每个 rank 只 1 个专家）。
+
+这些持有相同专家的 DP rank 处理的是**不同的 micro-batch 数据**，训练后各自产生一份该专家的梯度。这些梯度需要同步——这就是 Expert DP Group 的作用：
+
+```python
+# megatron/core/parallel_state.py
+# _EXPERT_DATA_PARALLEL_GROUP:
+# 包含持有相同专家的不同 DP rank
+# 在这些 rank 之间对专家梯度做 All-Reduce
+```
+
+**重要特殊情形**：当 `EP == num_experts` 时（DeepSeek-V3 的配置），每个 rank 只有 1 个专家 → 不同 DP rank 持有的专家完全不同 → Expert DP Group 退化为单 rank 组 → **不需要 Expert DP 的梯度同步**。这正是 V3 可以省掉大量 DP 通信的原因之一。
+
+### 4.3 EP + CP：为什么不在同一个进程组里
+
+先说结论：**EP 和 CP 可以在同一个训练中同时使用，只是不在同一套进程组里。** 这不是什么互斥 bug，而是两种并行各自服务于完全不同的目的。
+
+#### CP 为什么存在
+
+CP 切的是序列长度。Attention 层需要做 cross-token 计算——每个 token 要 attend 到序列中所有其他 token。当序列太长（128K+）时，单卡放不下全序列的激活 → 用 CP 把序列切成多段，通过 Ring / All-to-All 交换 KV，让每个 GPU 仍能计算完整的 attention。
+
+#### CP 为什么在 MoE 层没有意义
+
+MoE 的 FFN 是 **per-token 独立计算**——每个 token 只跟自己路由到的专家交互，token 之间没有依赖。所以 MoE 层不需要「看到全序列」，自然也不需要 CP。
+
+```
+Attention:  token_i 需要看到 token_0 ... token_n → 需要 CP 来跨 GPU 共享 KV
+MoE FFN:    token_i 只跟自己路由到的专家交互 → per-token 独立 → CP 无用
+```
+
+因此 Megatron 在 Expert 进程组中直接把 CP 固定为 1——不是不能用，是用不着。
+
+#### Attention 的 CP 切出来的 token 怎么进入 MoE
+
+Attention 输出后，每个 rank 上只有 1/CP 序列的 token。这些 token 进入 MoE 层时，就是该 rank 上的「本地 token」——MoE 层不关心这些 token 在完整序列中的位置，只关心每个 token 的 hidden state 要发给哪个专家。EP 的 dispatch 照常工作。
+
+```
+Attention 层 (CP=2):
+  GPU 0: token_0 ... token_{n/2-1}   ← 序列前半
+  GPU 1: token_{n/2} ... token_{n-1}  ← 序列后半
+
+进入 MoE 层:
+  GPU 0: 用自己的 token_{0..n/2-1} 走 Router → Dispatch → Expert Compute
+  GPU 1: 用自己的 token_{n/2..n-1} 走 Router → Dispatch → Expert Compute
+```
+
+唯一的实际影响是：CP 越大，进入 MoE 的 per-rank token 数越少 → EP 通信延迟占比越高 → 小 batch 时尤其明显。这和 DP 小了 GEMM 效率降是同一个道理。
+
+### 4.4 EP + PP：流水线中的 EP
+
+PP 切层（不同 stage 持有不同层），EP 切专家（同一 MoE 层的不同专家）。两者没有直接冲突。
+
+唯一需要注意的约束：Attention 层和 MoE 层在 PP 分组上必须一致（它们是交替堆叠的，同一 PP stage 内的 Attention 和 MoE 必须同组）。
+
+另外 PP 的 bubble 问题会影响所有并行维度的利用率——EP 的 All-to-All 发生在 PP 的 forward/backward 阶段内，bubble 期间 GPU 空闲，EP 通信自然也停了。
+
+### 4.5 通信量全景对比
+
+| 并行 | 通信操作 | 带宽需求 | 跨节点可行？ | 为什么？ |
+|------|---------|---------|------------|---------|
+| DP | All-Reduce（梯度） | **低** | ✅ | 每 micro-batch 才做一次，梯度通信量 ∝ 参数量/DP |
+| TP | All-Reduce / AllGather（激活） | **极高** | ❌ | 每层每 GEMM 都做，通信量 ∝ B×S×h，dense |
+| CP | Ring P2P（传 K/V chunk） | **极高** | ❌ | 每层 CP-1 次 ring step，K/V 全量交换，通信量 ∝ CP×S×h，dense |
+| PP | P2P Send/Recv | **低-中** | ✅ | 只传层边界激活，通信量 ∝ B×S×h |
+| **EP** | **All-to-All** | **中-高** | **✅** | 稀疏通信——只有路由到的 topk 专家参与，通信量 ∝ topk × tokens × h |
+
+**关键区分：dense vs sparse**
+
+- **TP 和 CP 都是 dense 通信**，所有 token/所有激活都参与，所以带宽需求极高，通常不能超出 NVLink 域（单节点 8 卡）。
+- **EP 是 sparse 通信**，每个 token 只发往 topk 个专家（通常 6-8），不是所有专家 rank 都参与。所以 EP 的总通信量远小于 dense 操作，跨节点走 IB 也能接受（但需要用 DualPipe 或 Wave 调度来隐藏延迟）。
 
 ---
 
-## 六、MoE 反向的确定性（Determinism）
+## 五、DeepEP：高性能 EP 通信库
 
-### 6.1 为什么 MoE 反向天然非确定性
+Megatron 原生的 All-to-All 用的是 NCCL 通用接口。DeepSeek 针对 MoE 场景的特点（数据量不均匀、需要拓扑感知）写了专用库 **DeepEP**，也是 Megatron-LM `flex` dispatcher 的后端。
 
-**来源 1：原子加顺序不确定**
+> 代码路径：`code/deepseek-ref/DeepEP`
 
-MoE 反向中，多个 token 可能路由到同一个专家。这些 token 对专家权重的梯度贡献需要累加。
+### 5.1 它做了什么
+
+DeepEP 的核心优化是**感知物理拓扑的融合 All-to-All**：
 
 ```
-// 伪代码：多个 SM 并发写同一个梯度 buffer
-atomicAdd(&grad_W[i][j], local_gradient);  // ← 浮点加法不可交换！
+通用 NCCL All-to-All:
+  permute kernel → NCCL All-to-All → permute kernel
+  问题: 3 个独立 launch，NCCL 不区分 NVLink vs RDMA
+
+DeepEP:
+  单个 kernel 内完成 permute + 数据传输
+  内部区分:
+    - NVLink 域内（scale-up）: 直接 GPU-to-GPU via symmetric memory + TMA
+    - 跨节点（scale-out）: NCCL Gin put via RDMA
 ```
 
-FP32 加法不满足结合律：(a+b)+c ≠ a+(b+c) 在浮点下。因此原子加的顺序不同 → 结果不同 → 不可复现。
+**混合模式**自动区分物理拓扑：
 
-**来源 2：跨 rank 的 token 数量变化**
+```
+32 GPU, 8 节点 × 4 GPU/节点:
+  scale-out_ranks = 8   ← RDMA 域（跨节点）
+  scale-up_ranks  = 4   ← NVLink 域（节点内）
+  
+  Dispatch 时:
+    节点内: TMA load → shared memory → TMA store (NVLink)
+    跨节点: TMA load → shared memory → Gin put (RDMA)
+```
 
-不同 step 中，路由到每个专家的 token 数量不同。EP 通信 buffer 的大小取决于 token 数量：
-- Buffer 大小变化 → 内存布局变化 → 累加顺序变化 → 结果不同
+### 5.2 关键技术点
 
-### 6.2 V4 的解决方案
+- **对称内存**：所有 rank 的通信 buffer 映射到同一虚拟地址空间，GPU 可直接访问 peer GPU 显存
+- **Pull 模式**：接收方主动从发送方拉数据（而不是发送方推 → 等通知），适合细粒度调度（V4 的 Wave 调度依赖这个）
+- **FP8 原生支持**：dispatch 用 FP8 省一半带宽（V3/V4 的关键优化）
+- **JIT 编译**：kernel 运行时编译，无需预装 CUDA toolchain
 
-**MoE 反向确定性方案（Section 3.3）**：
+### 5.3 Megatron 中的集成
 
-1. **Token 顺序预处理**：在 dispatch 前，将每个 rank 要处理的 token 按固定规则排序（如按 token ID 或 expert ID），确保同一批 token 在不同 run 中处理顺序一致。
+```python
+# megatron/core/transformer/moe/fused_a2a.py
+from deep_ep import Buffer
 
-2. **Rank 间 Buffer 隔离**：不同 rank 发来的数据写入不同的 buffer 区域，避免多 rank 竞争同一 buffer 位置。
+def get_buffer(group, hidden_bytes):
+    """获取通信 buffer，自动计算 NVLink 和 RDMA 各需要多少空间"""
+    # Buffer 内部根据 group.size() 自动判断拓扑
+    buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
+    return buffer
 
-3. **Per-SM 独立 Buffer + 确定性规约**：每个 SM 先累加到自己的私有 buffer，最后做一次确定性全局求和（预先排好顺序的 tree reduction）。
+# FusedDispatch / FusedCombine: 融合 permute + All-to-All
+```
 
-4. **禁止 Split-KV（注意力）**：Flash Attention 的 split-KV 会引入非确定性（K/V 切分方式不同 → 累加顺序不同）。V4 的注意力 kernel 不在 KV 维度做 split。
-
-### 6.3 Batch 不变性（Batch Invariance）
-
-更强的保证：同一 batch 数据，无论 batch 内样本如何排列，结果 bit-identical。
-
-实现要点：
-- 不用 Split-K GEMM（小 batch 场景）
-- 双核注意力策略（满波单 SM 核 + 尾波多 SM 核）
-- 所有 reduction 使用确定性顺序
+启用方式：`--moe-token-dispatcher-type flex --moe-enable-deepep`
 
 ---
 
-## 七、路由机制的深度解析
+## 六、关键数字与速查
 
-### 7.1 路由亲和分数：Sigmoid → Sqrt(Softplus) 的数学原因
+### 并行度约束
 
-```
-V2/V3: s_i = Sigmoid(W_route · x)    → 输出范围 (0, 1)
-V4:    s_i = Sqrt(Softplus(W_route · x)) → 输出范围 (0, +∞)，但增长被 sqrt 抑制
-```
+| 约束 | 值 | 原因 |
+|------|-----|------|
+| TP ≤ 8 | 通常 | NVLink 域 ≤ 8 GPU，超出走 IB 带宽骤降 |
+| EP ≤ num_experts | 硬性 | 每 rank 至少 1 个专家 |
+| 推荐 experts/rank | 1-4 | 太少→通信占比高，太多→计算太粗不利于负载均衡 |
+| EP 取 2 的幂 | 惯例 | 便于进程组划分和负载对称 |
 
-| 激活函数 | 输出范围 | 梯度行为 | 问题 |
-|---------|---------|---------|------|
-| Sigmoid | (0, 1) | 远离 0 时梯度消失 | 路由 scores 全部接近 0.5，区分度差 |
-| Softplus | (0, +∞) | 正值始终有梯度 | 大值无界，可能少数 token 垄断专家 |
-| Sqrt(Softplus) | (0, +∞) | 正值有梯度，但大值被压缩 | 平衡了区分度与极端值控制 |
+### Token Dispatcher 对比
 
-### 7.2 Hash 路由：为什么放在最前几层
-
-V4 将初始 3 个 Transformer block 的 FFN 从 Dense 替换为 Hash MoE + 后续层使用 Learnable Router MoE。
-
-Hash 路由原理：
-```
-expert_id = hash(token_id) % num_experts
-```
-
-为什么有效？
-- 输入层（embedding 附近）的路由信息量少，learnable router 容易退化为静态分配
-- Hash 路由可以看作是 learnable router 的一个廉价替代
-- 确定性的分配使得训练更稳定
-- 没有路由训练开销
-
-### 7.3 Anticipatory Routing：解决训练尖峰
-
-**问题**：万亿参数 MoE 训练中，偶尔出现 loss spike。回滚能恢复，但治标不治本。
-
-**观察**：spike 与 MoE 异常值及路由机制的 feedback loop 有关。
-
-**Anticipatory Routing 原理**：
-```
-step t 的输入特征用参数 θ_t 计算
-但路由选择用历史参数 θ_{t-Δt} 计算的路由索引
-```
-
-为什么这能缓解 spike？
-- θ_t 刚更新，可能产生 outlier 路由分布
-- θ_{t-Δt} 是已验证稳定的参数，路由分布更平滑
-- 用旧路由 + 新特征 = 破坏了可能导致 spike 的 feedback loop
-
-**代价**：
-- 需要在 t-Δt 预取数据并缓存路由索引（额外通信和存储）
-- Wall-time 额外开销 ~20%
-- 仅在 spike 检测到时短暂启用，稳定后关闭
-
-### 7.4 容量约束移除
-
-V3 对每个专家的路由 token 数有上限约束（capacity constraint），V4 移除了此约束。
-
-**为什么 V3 需要**：防止某些专家被过载导致显存溢出（每个 expert 的计算 buffer 需要预先分配固定大小）。
-
-**为什么 V4 可以移除**：
-- 无辅助损失策略使负载天然更均衡
-- 序列级平衡损失进一步防止单序列极端不均衡
-- 细粒度 EP 的 Wave 调度中，buffer 可以在 wave 间复用，降低了预分配压力
-- 动态 buffer 分配 + 更灵活的内存管理
+| Dispatcher | 底层通信 | 有计算冗余？ | 中间结果写 HBM？ | 适用 |
+|-----------|---------|------------|----------------|------|
+| `allgather` | AG + RS (TP×EP联合组) | 有（每个 rank 算所有 token） | 有 | EP ≤ 4，快速原型 |
+| `alltoall` | A2A (EP组) + AG/RS (TP组) 分离 | 无 | 有（permute 结果） | EP ≥ 8，训练标配 |
+| `flex` | DeepEP / HybridEP 融合 A2A | 无 | **无**（kernel内流转） | H100+，最优性能 |
 
 ---
 
-## 八、EP 性能分析：实测数据与理论限速
+## 七、常见问题 (FAQ)
 
-### 8.1 理论加速比分析
+### Q1: EP 和 TP 什么时候用哪个？
+**答**：两者正交，可以同时用。EP 切专家维度（通信量 O(topk·h)），TP 切矩阵维度（通信量 O(h²)）。专家多 → EP 优先；单专家矩阵大（d_ff 大） → 加 TP。实际训练中往往是两者一起用，只是各自的 size 根据模型配置调。
 
-论文 Figure 5 的理论加速比：
+### Q2: 为什么 allgather dispatcher 是默认值，但大家都用 alltoall？
+**答**：`allgather` 是安全默认（不需要复杂的通信拓扑感知），适合初次跑通。一旦 EP ≥ 8，allgather 的计算冗余不可接受，必须切到 alltoall。
 
-```
-Naive:                     1.00× (baseline)
-Comet (overlap L1/Dispatch + L2/Combine): 1.42×
-V4 (wave-based):           1.92×
-```
+### Q3: EP + CP 互斥怎么理解？真不能同时用吗？
+**答**：是说它们在 Megatron-LM 的同一个 RankGenerator 中互斥，不是说整个模型不能同时用。Attention 层用 CP（切序列）、MoE 层用 EP（切专家）是完全可行的——它们在不同的进程组体系中。只是进入 MoE 层时，CP 切分的序列片段被当作独立 token 处理。
 
-推导：假设通信占比为 p，计算占比为 (1-p)，则：
-- Naive 时间：T = T_comm + T_comp
-- Comet 时间：T = max(T_dispatch, T_L1) + max(T_L2, T_combine) ≈ max(p, 1-p)·T
-- V4（W 个 wave）：T = T_comm/W + T_comp/W（流水线填充后每个 wave 的开销被摊销）
+### Q4: EP 的通信量跟 batch size 有关吗？
+**答**：有关系。Batch 越大 → 每个 rank 的 token 越多 → All-to-All 总数据量增大 → 但单个 token 分摊的通信延迟更小（计算也更密集） → GEMM 更容易隐藏通信。Batch 小的时候（如推理），通信延迟占比高，是 EP 的痛点。
 
-对于 V4-Flash 的配置（256 专家，每 token 6 专家），p ≈ 通信时间 / 总时间 ≈ 0.35。理论上完美流水线加速比 = 1/(1-p) ≈ 1.54×。但 Wave 调度消除了尾延迟，实际效果更好（达到 1.92× 理论值）。
-
-### 8.2 实际性能数据
-
-| 场景 | 加速比 | 说明 |
-|------|--------|------|
-| 通用推理 | 1.50-1.73× | batch size 中等 |
-| RL Rollout | 最高 1.96× | 极小 batch，通信占比极高 |
-| 高速 Agent 服务 | 最高 1.96× | 延迟敏感，需流水线 |
-
-### 8.3 功耗墙问题
-
-融合 mega-kernel 的一个反直觉问题：**同时满载计算、内存带宽、网络带宽 → 总功耗超过 GPU TDP → 触发降频 → 性能反而下降**。
-
-这是一个真实的硬件限制。V4 论文建议硬件厂商为这类全并发负载预留更多功耗预算。
+### Q5: 为什么 V3 要设 EP == num_experts（每个 rank 1 个专家）？
+**答**：好处：(1) Expert DP Group 退化为单 rank → 省掉专家梯度的 DP 通信；(2) 每个 rank 只算 1 个专家的 GEMM，计算粒度最细 → 最适合 DualPipe 的细粒度调度。代价是 EP 通信跨 rank 更多 → 依赖节点限制路由和 DualPipe 来隐藏通信。
 
 ---
 
-## 九、EP 的容错与可抢占设计（后训练场景）
-
-### 9.1 为什么 RL/OPD Rollout 需要特殊容错
-
-后训练阶段（RL + On-Policy Distillation）的 rollout 特点：
-- 单个请求的生成可能很长（thinking mode 可达数万 token）
-- 集群级可抢占调度（任何任务随时可能被抢占）
-- 硬件故障常见（大规模集群中几乎是常态）
-
-### 9.2 Token 粒度 WAL（Write-Ahead Log）
-
-V4 后训练基础设施的核心设计：
-
-```
-每生成一个新 token：
-  1. 计算 logits
-  2. 采样得到 token
-  3. 立即追加到 WAL（persistent storage）
-  4. 更新 KV Cache
-
-抢占发生时：
-  1. 保存所有未完成请求的 KV Cache 到持久化存储
-  2. WAL 已记录当前已生成的 token 序列
-
-恢复时：
-  1. 读取 WAL + 保存的 KV Cache
-  2. 从断点继续解码（不需要从头重新生成！）
-```
-
-**为什么不能简单重新生成**：从头重新生成未被抢占的请求会引入**长度偏差**——只有被抢占的请求需要重新生成，而它们往往恰好是长序列请求。这会导致训练数据中长序列的系统性偏差。
-
-### 9.3 Batch 不变性与容错的配合
-
-如果生成过程是 batch 不变且确定性的，可以用固定 PRNG seed 完全复现。但 V4 选择 WAL 方案，因为：
-- 保持确定性需要额外工程成本
-- WAL + KV 恢复的开销远小于重新生成
-
----
-
-## 十、深度面试问答（15 题）
-
-### Q1: 推导 MoE 层的 computation-communication ratio，并解释其工程意义。
-
-在 MoE 层中，每个 token-expert pair：
-- 计算量 = 6·h·d_ff FLOPs（SwiGLU 三个矩阵乘，各 2·h·d_ff）
-- 通信量 = 3h 字节（FP8 dispatch h 字节 + BF16 combine 2h 字节）
-- 比值 = 2·d_ff
-
-因此通信可被隐藏的充分条件是：C/B ≤ 2·d_ff。
-
-对 V4-Pro (d_ff=3072)：阈值 6144 FLOPs/Byte。给定 400GB/s NVLink，最多可隐藏 2.46 PFLOP/s 计算，远超单卡 FP8 峰值 ~2 PFLOP/s。因此 NVLink 下通信可完全隐藏。给定 50GB/s InfiniBand，最多可隐藏 307 TFLOP/s，远低于峰值，通信成为瓶颈。
-
-工程意义：这个公式是硬件选型的核心依据——给定模型配置，可以直接算需要多少带宽才能通信不成为瓶颈。
-
-### Q2: Wave 调度与 Comet 的重叠方案有什么本质区别？
-
-Comet 是**两段式重叠**：Dispatch 与 Linear-1 重叠，Combine 与 Linear-2 重叠。但它需要 dispatch 全部完成才能开始计算。
-
-Wave 是**多段流水线重叠**：将专家切成 W 个 wave，每个 wave 独立流水线。关键区别：
-1. 流水线深度：Comet = 2 段，Wave = W 段
-2. 启动延迟：Wave 只需等第一个 wave 的 dispatch 完成即可开始计算
-3. 尾延迟：Wave 的尾波可以用多 SM 核加速
-4. 对 batch 大小的鲁棒性：Wave 在极小 batch 下增益更大
-
-### Q3: 为什么 DeepSeek 选择 Pull 而非 Push 做 Dispatch？
-
-Push 的发送方需要通知接收方数据已就绪。在细粒度 wave 调度中，每个 wave 粒度极小（可能几十 μs），通知延迟不可忽略。
-
-Pull 模式中，每个 GPU 知道自己负责哪些专家，可以直接从其他 rank 拉取数据。计算方 = 接收方 = 发起方，通信节奏由计算方控制，不需要额外信令。
-
-代价：发送方需要提前准备好数据并暴露可读 buffer，增加一些内存和同步开销。
-
-### Q4: 无辅助损失负载均衡的本质是什么？为什么比 Aux Loss 好？
-
-本质是将负载均衡信号与梯度优化信号**解耦**。Aux Loss 通过梯度影响路由参数，与 LM 优化目标竞争梯度方向。无辅助损失通过启发式规则直接调整 per-expert bias（不经过反向传播），两个信号独立。
-
-这种设计的好处：
-1. 不需要调 α 超参
-2. LM 性能不被负载均衡目标损害
-3. 收敛更稳定（路由不会在 LM 和负载均衡之间振荡）
-
-### Q5: FP4 QAT 在 MoE EP 中的角色是什么？
-
-V4 后训练阶段对 MoE 专家权重做 MXFP4 量化感知训练：
-- 前向：FP32 master → 量化到 FP4 → 反量化到 FP8 → FP8 GEMM
-- 反向：对 FP8 权重求梯度，STE 回传 FP32 master
-- 推理：直接用原生 FP4 权重，显存减少 ~50%
-
-关键设计：FP4(E2M1) → FP8(E4M3) 反量化。FP8 的动态范围比 FP4 大得多（E4M3 的指数范围是 E2M1 的 8 倍），因此 FP4 的细粒度 scale 可以被 FP8 完全吸收。
-
-### Q6: EP 训练中，为什么 MoE 梯度的同步要用两阶段 All-to-All + 本地求和，而不是直接 All-Reduce？
-
-All-Reduce（ring 或 tree）的每一跳都在低精度（BF16）做累加，误差在 N 跳中累积。N 越大，误差越大。
-
-两阶段方案先用 All-to-All 在 BF16 精度下纯传输（不累加），然后各 rank 在 FP32 本地求和。只有一次低精度传输，无误差传播。
-
-这和 EP 的通信模式天然吻合——MoE 参数已经按 EP 维度分布，All-to-All 的通信拓扑与 EP 的 Dispatch/Combine 一致。
-
-### Q7: 解释 Wave Quantization 问题及其解决方案。
-
-当 token 总数不能被 wave 内的 SM 数量或 tile 大小整除时，尾波（最后几个 wave 或最后一个 wave）的计算资源利用率下降。
-
-V4 的解决方案：双核策略：
-- 满波：单 SM 做完整个 GEMM（避免 split-k 导致 batch 不变性问题）
-- 尾波：多 SM 并发处理，降低延迟
-- 精心设计的累加顺序保证两种核结果 bit-identical
-
-### Q8: MoE EP 为什么对 batch 大小敏感？
-
-小 batch 下：
-- 每个专家收到的 token 数可能为 0
-- 通信时间相对计算时间占比更高
-- Wave 调度中空 wave 多，流水线效率低
-
-大 batch 下：
-- 负载天然更均衡（统计意义上）
-- 通信可被大型 GEMM 隐藏
-- Wave 调度接近完美流水线
-
-这就是为什么 V4 的加速比在 RL rollout（小 batch）下最高 1.96×——小 batch 场景的优化空间最大。
-
-### Q9: 为什么把前几层的 Dense FFN 换成 Hash MoE？
-
-输入层的 embedded token 信息量有限，learnable router 的区分度差。Hash 路由用 token ID 的哈希函数确定性分配专家，避免了低质量的路由训练。同时 Hash MoE 增加了模型容量（比 Dense FFN 更多参数），且无路由训练开销。
-
-3 层之后 token 通过 Attention 已经融合了上下文信息，此时 learnable router 才能有效工作。
-
-### Q10: EP 通信的功耗墙是什么意思？怎么解决？
-
-Mega-kernel 使得 GPU 的计算单元（Tensor Core）、内存带宽（HBM）、网络带宽（NVLink/NIC）三者同时满载。总功耗 = P_compute + P_memory + P_network > GPU TDP → 硬件降频 → 实际性能低于理论峰值。
-
-这是硬件的物理限制，软件层面只能缓解（如降低 SM 频率换取更多功耗给网络）。
-
-### Q11: EP 中，token 如何在各个 rank 间路由？路由决策在哪里发生？
-
-所有 rank 对自己持有的 token 独立计算路由亲和分数。由于 embedding 和 attention 输出在每个 rank 上都是完整的（TP 内是切分的，但 EP 前会通过 All-Reduce 或 All-Gather 恢复），每个 rank 可以独立决定自己 token 的 top-k 专家。
-
-然后通过 All-to-All 将 token 发送到对应专家所在的 EP rank。
-
-注意：这要求所有 rank 上的 gating network 权重是一致的（EP 维度上 gating 参数是复制的，不是切分的）。Gating 网络本身很小（h × E），复制的开销可忽略。
-
-### Q12: 对比 V2/V3/V4 在 EP 策略上的演进。
-
-| 维度 | V2 | V3 | V4 |
-|------|----|----|-----|
-| 专家数 | 160 | 256 | 384/256 |
-| 激活专家/token | 6 | 8 | 6 |
-| 通信重叠 | 无 | Dispatch+Compute 粗粒度重叠 | Wave 级细粒度重叠 |
-| 融合程度 | 分离 kernel | 分离 kernel + 调度重叠 | 单一 Mega-Kernel |
-| Dispatch 精度 | BF16 | BF16 | FP8 |
-| 负载均衡 | Aux Loss | Aux-loss-free (bias) | Aux-loss-free + Sequence Balance |
-| 容量约束 | 有 | 有 | 无 |
-| 路由激活 | Sigmoid | Sigmoid | Sqrt(Softplus) |
-| 混合 ZeRO | 无 | 无 | 背包算法 + 两阶段规约 |
-| 确定性 | 不保证 | 部分保证 | Batch 不变 + 确定性 |
-
-### Q13: EP 和 TP 如何协作？什么情况下选 EP 优先，什么情况选 TP 优先？
-
-EP 和 TP 是正交的并行维度，可以同时使用：
-
-- EP 切的是「专家维度」——不同专家在不同 GPU
-- TP 切的是「层内矩阵维度」——同一个专家的矩阵乘被切分
-
-选择优先级：
-- 专家数量多 → 优先 EP（天然并行度）
-- 单个专家矩阵大 → 优先 TP
-- 通信瓶颈大 → 优先 EP（EP 的通信量是 O(token·h)，TP 是 O(h²)）
-- 小 batch → EP 通信占比高，TP 更合适
-
-DeepSeek V4 实际用了 EP（切专家）+ TP（切 Attention 的 QKV 和 MoE 的 large GEMM）+ DP + PP 的四维混合。
-
-### Q14: 讲一下 MegaMoE 开源实现中包含的关键优化。
-
-MegaMoE 是 DeepGEMM 的一部分（GitHub PR #304），关键优化包括：
-
-1. **Persistent Kernel**：单个 kernel 持续运行，处理所有 wave，消除 kernel relaunch 开销
-2. **SM 级别的生产者-消费者流水线**：不同 SM 承担不同 wave 的通信/计算角色
-3. **TileLang 代码生成**：用 DSL 自动生成融合 kernel，平衡开发效率和运行效率
-4. **Host Codegen**：消除 Python 运行时检查开销（从数十/数百 μs → <1μs per call）
-5. **混合精度计算**：FP8 GEMM + BF16 后处理 + FP32 累加
-
-### Q15: 如果让你为一个全新的 MoE 架构设计 EP 方案，你会考虑哪些因素？
-
-1. **专家数量与每 token 激活数** → 决定 EP 并行度上限和通信量
-2. **单专家参数量** → 决定是否需要 TP 与之配合
-3. **互联拓扑** → NVLink 带宽 vs 网络带宽，决定 wave 粒度
-4. **Batch 大小预期** → 训练/推理的 batch 分布，影响波次调度策略
-5. **负载均衡策略** → 是否允许 token dropping，capacity factor 设计
-6. **精度需求** → Dispatch/Combine 可以用多低的精度
-7. **确定性需求** → 是否需要 batch 不变，如何设计 atomics 和 reduction
-8. **硬件特性** → GPU/NPU 的通信原语、SM 架构、功耗限制
-9. **容错需求** → 是否需要可抢占、可恢复的通信方案
-10. **与训练框架的整合** → autograd、checkpoint、ZeRO 的兼容性
-
----
-
-## 十一、一周复习计划
-
-| 天 | 主题 | 核心内容 |
-|---|------|---------|
-| **Day 1** | **EP 并行（本文档）** | 数学推导、Wave 调度、Mega-Kernel、负载均衡、混合并行 |
-| **Day 2** | **TP + PP + DualPipe** | 张量切分的数学，1F1B vs DualPipe，通信量与计算量分析 |
-| **Day 3** | **ZeRO + 混合并行** | ZeRO-1/2/3 的通信量、FSDP、与 EP 的交互 |
-| **Day 4** | **MoE 架构深度** | GShard → Switch Transformer → DeepSeekMoE → Hash MoE |
-| **Day 5** | **Attention + KV Cache** | MLA 数学推导、GQA/MQA、Flash Attention、CSA/HCA |
-| **Day 6** | **训练稳定性 + 精度** | FP8/FP4 混合精度、Loss Spike 机理、Muon 优化器 |
-| **Day 7** | **综合模拟面试** | 串联所有知识点，练习从「推导公式」角度回答 |
-
----
-
-## 十二、必背公式与关键数字
-
-### 必背公式
-
-| 公式 | 含义 |
-|------|------|
-| V_comp = 6·h·d_ff | 每 token-expert pair 的 SwiGLU 计算量 |
-| V_comm = 3h (FP8+B16) | 每 token-expert pair 的通信量 |
-| C/B ≤ 2d_ff | 通信可隐藏条件 |
-| C/B ≤ 6144 (V4-Pro) | 代入 d_ff=3072 |
-| 每 GB/s 带宽隐藏 6.1 TFLOP/s | 工程经验值 |
-
-### 必背数字
-
-| 数字 | 含义 |
-|------|------|
-| 1.50-1.73× | MegaMoE 通用推理加速 |
-| 1.96× | RL Rollout 场景加速 |
-| 1.42× | Comet 理论加速 |
-| 1.92× | V4 Wave 调度理论加速 |
-| 0.001 | Aux-loss-free bias 更新速度 |
-| 0.0001 | Sequence balance loss 权重 |
-| 6.7% | mHC 引入的额外 wall-time 开销 |
-| 20% | Anticipatory Routing 额外 wall-time 开销 |
-| < 1μs | Host Codegen 后的 kernel launch 开销 |
-| 99.7% | FP4 indexer 量化后的 KV 召回率 |
-
----
-
-## 十三、推荐阅读
-
-1. **DeepSeek-V4 Technical Report** Section 3.1 — 细粒度 EP 原文（本文档主要来源）
-2. **DeepSeek-V3 Technical Report** (arXiv:2412.19437) — DualPipe, FP8 training, auxiliary-loss-free
-3. **DeepSeek-V2 Technical Report** (arXiv:2405.04434) — DeepSeekMoE architecture
-4. **Comet** (Zhang et al., 2025b) — Fine-grained computation-communication overlapping for MoE
-5. **DeepGEMM** (github.com/deepseek-ai/DeepGEMM) — MegaMoE 开源实现
-6. **GShard** (arXiv:2006.16668) — MoE 大规模并行的基础工作
-7. **Switch Transformer** (arXiv:2101.03961) — Capacity Factor, token dropping
-8. **MegaBlocks** (arXiv:2211.15841) — Block-sparse MoE, 负载均衡
+## 八、延伸阅读
+
+- 📖 [Megatron-LM MoE 源码](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/transformer/moe) — token_dispatcher.py, moe_layer.py, experts.py, fused_a2a.py
+- 📖 [DeepEP GitHub](https://github.com/deepseek-ai/DeepEP) — 高性能 EP 通信库
+- 📖 [GShard](papers/GShard%20MoE%20Sharding.pdf) — MoE 大规模并行的基础工作
+- 📖 [DeepSpeed-MoE](papers/DeepSpeed-MoE%20EP.pdf) — DeepSpeed 中的 EP 实现
+- 📖 [Megatron-LM TP + PP + DP](papers/Megatron-LM%20TP%20PP%20DP.pdf) — Megatron 的混合并行方法论
+- 📖 [混合精度训练](topics/mixed-precision-training.md) — EP 通信中 FP8 dispatch / BF16 combine 的精度选择
+- 📖 [DeepSeek-V3 中文笔记](papers-zh/DeepSeek-V3.md) — V3 的 DualPipe + EP 通信重叠
+- 📖 [DeepSeek-V4 技术报告](papers/DeepSeek-V4%20Technical%20Report.pdf) — V4 的细粒度 EP 方案
+
+> **V3/V4 的 EP 深度分析**：见 [notes/expert-parallelism/deepseek-ep-in-depth.md](notes/expert-parallelism/deepseek-ep-in-depth.md)，涵盖 DeepEP 架构、DualPipe EP 重叠、Wave 调度、Mega-Kernel、EP 确定性等进阶话题。

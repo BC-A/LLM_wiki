@@ -425,5 +425,6 @@ FP32 Weight Gradient → Optimizer Update
 - 📖 [DeepSeek-V3 中文笔记](papers-zh/DeepSeek-V3.md) — 论文精读
 - 📖 [DeepSeek-V4 Technical Report](papers/DeepSeek-V4%20Technical%20Report.pdf) — FP4 QAT 方案
 - 📖 [DeepSeek-V4 中文笔记](papers-zh/DeepSeek-V4-technical-report.zh.md)
+- 📖 [Megatron-LM 性能优化指南](topics/megatron-performance-optimization.md) — FP8 训练在 Megatron-LM 中的完整配置（FP8 recipe、MoE FP8 dispatch、FP8 Param Gather）
 - 📖 [Expert Parallelism 深度笔记](topics/expert-parallelism.md) — EP 通信与精度/效率的关联
 - 📖 [INDEX.md — FP8/FP4 低精度训练](INDEX.md#fp8--fp4-低精度训练)
